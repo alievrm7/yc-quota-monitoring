@@ -1,0 +1,23 @@
+{{- range $configMap := $.Values.configMap }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  labels: {{ include "_helper.global.labels" $ | nindent 4 }}
+  name: {{ tpl $configMap.name $ }}
+data:
+{{- range $conf := $configMap.files }}
+{{- $path := join "/" (list
+    ($.Values.chartConfigMapFolder | default)
+    ($.Values.configMapFolder | default)
+    ($configMap.path | default)
+    $conf
+    ) | replace "//" "/" | trimPrefix "/" }}
+{{ ($.Files.Glob (tpl $path $)).AsConfig | indent 4 }}
+{{- end }}
+{{- range $item := $configMap.data }}
+{{ $item.filename | indent 2}}: |
+{{ $item.value | indent 4 }}
+{{- end }}
+...
+{{- end }}

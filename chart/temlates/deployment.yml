@@ -1,0 +1,71 @@
+{{- if .Values.containers.image }}
+
+{{- $rolloutEnabled   := (.Values.rollout.enabled | default false) }}
+{{- $existingRollout  := dict }}
+{{- if $rolloutEnabled }}
+{{-   $existingRollout = lookup "argoproj.io/v1alpha1" "Rollout" .Release.Namespace .Values.project.service }}
+{{- end }}
+
+{{- /* rollout уже существует, если lookup что-то вернул */}}
+{{- $rolloutPresent := and $rolloutEnabled (not (empty $existingRollout)) }}
+
+{{- $replicaCount := ternary 0 .Values.replicaCounter $rolloutPresent }}
+
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.project.service }}
+  labels: {{ include "_helper.global.labels" $ | nindent 4 }}
+spec:
+  replicas: {{ $replicaCount }}
+  selector:
+    matchLabels: {{ include "_helper.global.selectorLabels" $ | nindent 6 }}
+      {{- if and .Values.feature.enabled }}
+      feature: master
+      {{- end }}
+  template:
+    metadata:
+      annotations:
+        {{- include "application.annotations" . | nindent 8 }}
+      labels: {{ include "_helper.pod.labels" $ | nindent 8 }}
+        {{- if and .Values.feature.enabled }}
+        feature: master
+        {{- end }}
+    spec:
+      {{- if or .Values.containers.secrets .Values.containers.configMaps .Values.containers.persistentVolumeClaims }}
+      volumes: {{- include "application.volumes" . | indent 8 }}
+      {{- end }}
+      containers:
+      - name: {{ .Values.project.service }}
+        image: {{ .Values.containers.registry }}/{{ tpl .Values.containers.image $ }}:{{- include "application.image.tag" . }}
+        command: {{ .Values.containers.command | toYaml | default | nindent 10 }}
+        env: {{ include "_helper.pod.env" $ | indent 10 }}
+        envFrom: {{ tpl ($.Values.containers.envs.envFrom | toYaml) $ | nindent 12 }}
+        {{- if .Values.containers.args }}
+        args:
+        {{- range .Values.containers.args }}
+          - {{ . }}
+        {{- end }}
+        {{- end }}
+        {{- if or .Values.containers.secrets .Values.containers.configMaps .Values.containers.persistentVolumeClaims }}
+        volumeMounts: {{- include "application.volumeMounts" . | indent 8 }}
+        {{- end }}
+        resources: {{ tpl (.Values.containers.resources | toYaml | default) $ | nindent 10 }}
+        securityContext:
+          runAsUser: {{ .Values.containers.runAsUser }}
+        ports:
+        {{- range .Values.containers.ports }}
+        - name: {{ .name }}
+          containerPort: {{ .containerPort }}
+        {{- end }}
+        {{- if .Values.containers.probes }}
+        {{- tpl (.Values.containers.probes | toYaml | default) $ | nindent 8 }}
+        {{- end }}
+      affinity: {{- include "_helper.pod.affinity" $ | nindent 8 }}
+      nodeSelector: {{ tpl (.Values.nodeSelector | toYaml | default) $ | nindent 8 }}
+      tolerations: {{ tpl (.Values.tolerations | toYaml | default) $ | nindent 8 }}
+      {{- if semverCompare ">=1.25-0" .Capabilities.KubeVersion.Version }}
+      topologySpreadConstraints: {{- include "_helper.pod.topologySpreadConstraints" $ | nindent 8 }}
+      {{- end }}
+{{- end }}

@@ -1,0 +1,15 @@
+{{- if .Values.serviceMonitor }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ .Values.project.service }}
+  labels:
+    app: {{ .Values.project.service }}
+    release: {{ .Values.serviceMonitor.prometheusRelease }}
+spec:
+  endpoints: {{ tpl (.Values.serviceMonitor.endpoints | toYaml | default) $ | nindent 4 }}
+  selector:
+    matchLabels: {{ include "_helper.global.selectorLabels" $ | nindent 6 }}
+...
+{{- end }}

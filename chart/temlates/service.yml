@@ -1,0 +1,18 @@
+{{- if .Values.containers.image }}
+kind: Service
+apiVersion: v1
+metadata:
+  annotations: {{ include "_helper.service.annotations" $ | nindent 4 }}
+  labels: {{ include "_helper.global.labels" $ | nindent 4 }}
+  name: {{ include "network.service_name" . }}
+spec:
+  ports:
+  {{- range .Values.containers.ports }}
+  - name: {{ .name }}
+    protocol: {{ .protocol }}
+    port: {{ .servicePort }}
+    targetPort: {{ .containerPort }}
+  {{- end }}
+  selector: {{ include "_helper.global.selectorLabels" $ | nindent 4 }}
+...
+{{- end }}
