@@ -18,6 +18,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// ================== Config ==================
+
 const (
 	defaultPort = "8080"
 )
@@ -29,6 +31,8 @@ var apiEndpoints = map[string]string{
 	"quotaServices":   "https://quota-manager.api.cloud.yandex.net/quota-manager/v1/quotaLimits/services",
 	"quotaLimits":     "https://quota-manager.api.cloud.yandex.net/quota-manager/v1/quotaLimits",
 }
+
+// ================== HTTP client ==================
 
 var httpClient = &http.Client{
 	Timeout: 15 * time.Second,
@@ -43,7 +47,8 @@ var httpClient = &http.Client{
 	},
 }
 
-// ---------- Prometheus metrics ----------
+// ================== Prometheus metrics ==================
+
 var (
 	quotaUsageGauge = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -55,6 +60,7 @@ var (
 			"org_id", "cloud_id", "org_name", "cloud_name",
 		},
 	)
+
 	quotaLimitGauge = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "yandex_quota_limit",
@@ -65,12 +71,14 @@ var (
 			"org_id", "cloud_id", "org_name", "cloud_name",
 		},
 	)
+
 	lastScrapeStatus = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "yandex_quota_scrape_success",
 			Help: "1 if the last scrape succeeded, 0 otherwise.",
 		},
 	)
+
 	lastScrapeTs = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "yandex_quota_scrape_timestamp_seconds",
@@ -83,30 +91,37 @@ func init() {
 	prometheus.MustRegister(quotaUsageGauge, quotaLimitGauge, lastScrapeStatus, lastScrapeTs)
 }
 
-// ---------- Types ----------
+// ================== Types ==================
+
+// Организация
 type orgItem struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
 }
+type listOrganizationsResp struct {
+	Organizations []orgItem `json:"organizations"`
+}
+
+// Облако
 type cloudItem struct {
 	ID             string `json:"id"`
 	Name           string `json:"name"`
 	OrganizationID string `json:"organizationId"`
 }
 
-type listOrganizationsResp struct {
-	Organizations []orgItem `json:"organizations"`
+type listCloudsResp struct {
+	Clouds []cloudItem `json:"clouds"`
 }
+
+// Биллинг-аккаунты: нужен только id
 type idOnly struct {
 	ID string `json:"id"`
 }
 type listBillingResp struct {
 	BillingAccounts []idOnly `json:"billingAccounts"`
 }
-type listCloudsResp struct {
-	Clouds []cloudItem `json:"clouds"`
-}
 
+// Сервисы квот
 type quotaService struct {
 	ID string `json:"id"`
 }
@@ -114,16 +129,49 @@ type quotaServicesResp struct {
 	Services []quotaService `json:"services"`
 }
 
+// Квоты
 type QuotaLimit struct {
 	QuotaID string   `json:"quotaId"`
 	Limit   *float64 `json:"limit"`
 	Usage   *float64 `json:"usage"`
 }
+
 type quotaLimitsResp struct {
 	QuotaLimits []QuotaLimit `json:"quotaLimits"`
 }
 
-// ---------- Error helpers ----------
+// ================== Helpers ==================
+
+func envTrue(key string) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	return v == "true" || v == "1" || v == "yes" || v == "y"
+}
+
+func quietBenign() bool { return envTrue("QUIET_BENIGN") }
+
+// ================== IAM token ==================
+
+func getIAMToken(_ context.Context) (string, error) {
+	path := strings.TrimSpace(os.Getenv("YC_IAM_TOKEN_FILE"))
+	if path == "" {
+		return "", errors.New("YC_IAM_TOKEN_FILE not set")
+	}
+
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read token file: %w", err)
+	}
+
+	tok := strings.TrimSpace(string(b))
+	if tok == "" {
+		return "", errors.New("token file is empty")
+	}
+
+	return tok, nil
+}
+
+// ================== Error helpers ==================
+
 type apiError struct {
 	Status     int
 	Code       int
@@ -149,9 +197,8 @@ func (e *apiError) isBenignUnsupported() bool {
 	return false
 }
 
-func quietBenign() bool { return strings.EqualFold(os.Getenv("QUIET_BENIGN"), "true") }
+// ================== Generic GET ==================
 
-// ---------- Generic GET ----------
 func apiGET(ctx context.Context, endpoint string, bearer string, params map[string]string, out interface{}) error {
 	u, _ := url.Parse(endpoint)
 	q := u.Query()
@@ -184,7 +231,8 @@ func apiGET(ctx context.Context, endpoint string, bearer string, params map[stri
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
-// ---------- Core scrape ----------
+// ================== Core scrape ==================
+
 type resource struct {
 	id           string
 	resourceType string
@@ -198,70 +246,83 @@ type resource struct {
 func listResources(ctx context.Context, bearer string, billingIDs []string) ([]resource, error) {
 	var res []resource
 
-	// 1) Поднимем словарь orgID -> orgName
+	enableOrg := envTrue("ENABLE_ORG")
+	enableCloud := envTrue("ENABLE_CLOUD")
+	enableBilling := envTrue("ENABLE_BILLING")
+
+	if !enableOrg && !enableCloud && !enableBilling {
+		return res, nil
+	}
+
+	// 1) Организации (и словарь id->name для облаков)
 	orgNames := map[string]string{}
-
-	var orgs listOrganizationsResp
-	if err := apiGET(ctx, apiEndpoints["organizations"], bearer, nil, &orgs); err == nil {
-		for _, o := range orgs.Organizations {
-			orgNames[o.ID] = o.Name
-			// ресурс уровня организации
-			res = append(res, resource{
-				id:           o.ID,
-				resourceType: "organization-manager.organization",
-				labelKey:     "org_id",
-				orgID:        o.ID,
-				orgName:      o.Name,
-			})
+	if enableOrg || enableCloud {
+		var orgs listOrganizationsResp
+		if err := apiGET(ctx, apiEndpoints["organizations"], bearer, nil, &orgs); err == nil {
+			for _, o := range orgs.Organizations {
+				orgNames[o.ID] = o.Name
+				if enableOrg {
+					res = append(res, resource{
+						id:           o.ID,
+						resourceType: "organization-manager.organization",
+						labelKey:     "org_id",
+						orgID:        o.ID,
+						orgName:      o.Name,
+					})
+				}
+			}
+		} else {
+			log.Printf("warn: organizations: %v", err)
 		}
-	} else {
-		log.Printf("warn: organizations: %v", err)
 	}
 
-	// 2) Облака: берём org_id из cloud.OrganizationID и восстанавливаем org_name из словаря
-	var clouds listCloudsResp
-	if err := apiGET(ctx, apiEndpoints["clouds"], bearer, nil, &clouds); err == nil {
-		for _, c := range clouds.Clouds {
-			res = append(res, resource{
-				id:           c.ID,
-				resourceType: "resource-manager.cloud",
-				labelKey:     "cloud_id",
-				cloudID:      c.ID,
-				cloudName:    c.Name,
-				orgID:        c.OrganizationID,
-				orgName:      orgNames[c.OrganizationID], // ← вот он, org_name
-			})
-		}
-	} else {
-		log.Printf("warn: clouds: %v", err)
-	}
-
-	// 3) Биллинг-аккаунты (имя организации здесь API не даёт — оставим пустым)
-	if len(billingIDs) == 0 {
-		var bl listBillingResp
-		if err := apiGET(ctx, apiEndpoints["billingAccounts"], bearer, nil, &bl); err == nil {
-			for _, b := range bl.BillingAccounts {
+	// 2) Облака
+	if enableCloud {
+		var clouds listCloudsResp
+		if err := apiGET(ctx, apiEndpoints["clouds"], bearer, nil, &clouds); err == nil {
+			for _, c := range clouds.Clouds {
 				res = append(res, resource{
-					id:           b.ID,
-					resourceType: "billing.account",
-					labelKey:     "billing_account_id",
-					// org/cloud метки остаются пустыми (это нормально)
+					id:           c.ID,
+					resourceType: "resource-manager.cloud",
+					labelKey:     "cloud_id",
+					cloudID:      c.ID,
+					cloudName:    c.Name,
+					orgID:        c.OrganizationID,
+					orgName:      orgNames[c.OrganizationID],
 				})
 			}
 		} else {
-			log.Printf("warn: billingAccounts: %v", err)
+			log.Printf("warn: clouds: %v", err)
 		}
-	} else {
-		for _, id := range billingIDs {
-			id = strings.TrimSpace(id)
-			if id == "" {
-				continue
+	}
+
+	// 3) Биллинг
+	if enableBilling {
+		if len(billingIDs) == 0 {
+			var bl listBillingResp
+			if err := apiGET(ctx, apiEndpoints["billingAccounts"], bearer, nil, &bl); err == nil {
+				for _, b := range bl.BillingAccounts {
+					res = append(res, resource{
+						id:           b.ID,
+						resourceType: "billing.account",
+						labelKey:     "billing_account_id",
+					})
+				}
+			} else {
+				log.Printf("warn: billingAccounts: %v", err)
 			}
-			res = append(res, resource{
-				id:           id,
-				resourceType: "billing.account",
-				labelKey:     "billing_account_id",
-			})
+		} else {
+			for _, id := range billingIDs {
+				id = strings.TrimSpace(id)
+				if id == "" {
+					continue
+				}
+				res = append(res, resource{
+					id:           id,
+					resourceType: "billing.account",
+					labelKey:     "billing_account_id",
+				})
+			}
 		}
 	}
 
@@ -271,7 +332,6 @@ func listResources(ctx context.Context, bearer string, billingIDs []string) ([]r
 func listServices(ctx context.Context, bearer, resourceType string) ([]string, error) {
 	var resp quotaServicesResp
 	if err := apiGET(ctx, apiEndpoints["quotaServices"], bearer, map[string]string{
-
 		"resourceType": resourceType,
 	}, &resp); err != nil {
 		return nil, err
@@ -285,7 +345,7 @@ func listServices(ctx context.Context, bearer, resourceType string) ([]string, e
 	return out, nil
 }
 
-// in-memory чёрный список неподдерживаемых пар: resourceType -> service -> true
+// Кэш неподдерживаемых пар: resourceType -> service -> true
 var unsupported = map[string]map[string]bool{}
 
 func markUnsupported(rt, svc string) {
@@ -304,9 +364,11 @@ func isUnsupported(rt, svc string) bool {
 }
 
 func scrapeOnce(ctx context.Context) error {
-	token := strings.TrimSpace(os.Getenv("YC_TOKEN"))
+	token, err := getIAMToken(ctx)
+	if err != nil {
+		return err
+	}
 
-	// Явные billing IDs (опционально)
 	var billingIDs []string
 	if v := os.Getenv("BILLING_ID"); v != "" {
 		for _, p := range strings.Split(v, ",") {
@@ -327,7 +389,7 @@ func scrapeOnce(ctx context.Context) error {
 	servicesCache := map[string][]string{}
 
 	for _, r := range resources {
-		// список сервисов
+		// получаем список сервисов
 		var svcs []string
 		if cached, ok := servicesCache[r.resourceType]; ok {
 			svcs = cached
@@ -358,7 +420,6 @@ func scrapeOnce(ctx context.Context) error {
 				"service":       svc,
 			}
 			if err := apiGET(ctx, apiEndpoints["quotaLimits"], token, params, &qresp); err != nil {
-				// ожидаемые кейсы: not supported / not found / no backup provider
 				if ae, ok := err.(*apiError); ok && ae.isBenignUnsupported() {
 					markUnsupported(r.resourceType, svc)
 					if !quietBenign() {
@@ -396,7 +457,8 @@ func scrapeOnce(ctx context.Context) error {
 	return nil
 }
 
-// ---------- HTTP server ----------
+// ================== HTTP server ==================
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
